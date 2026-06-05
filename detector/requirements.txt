@@ -1,0 +1,4 @@
+elasticsearch==8.15.1
+pandas>=2.2
+scikit-learn>=1.5
+numpy>=1.26

@@ -1,0 +1,117 @@
+# Mini-SIEM en vivo — todo dockerizado.
+# Demo ISA2 (ORT Uruguay). Detección de anomalías sobre tráfico real.
+#
+# Uso:
+#   docker compose up -d                       # arranca todo (ES, Kibana, API, baseline, detector)
+#   docker compose logs -f detector            # ver el detector trabajar
+#   docker compose run --rm ddos               # disparar ataque DDoS
+#   docker compose run --rm bruteforce         # disparar brute force
+#   docker compose down                        # bajar todo (preserva datos)
+#   docker compose down -v                     # bajar y borrar datos de Elastic
+
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.18.2
+    container_name: siem-es
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.http.ssl.enabled=false
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      - ingest.geoip.downloader.enabled=false
+    ports:
+      - "9200:9200"
+    volumes:
+      - es-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health | grep -E '(green|yellow)' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.18.2
+    container_name: siem-kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - XPACK_SECURITY_ENABLED=false
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./src/SiemDemo.Api
+    container_name: siem-api
+    environment:
+      - ELASTICSEARCH_URL=http://elasticsearch:9200
+    ports:
+      - "5080:5080"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # Tráfico baseline — corre todo el tiempo que dure DURATION (ajustá si necesitás)
+  baseline:
+    image: grafana/k6:latest
+    container_name: siem-baseline
+    command: ["run", "-e", "BASE_URL=http://api:5080", "-e", "DURATION=24h", "-e", "RATE=10", "-e", "TYPO_RATE=0.005", "/scripts/baseline.js"]
+    volumes:
+      - ./loadgen:/scripts:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Detector multi-algoritmo. Espera ~60s entrenando y entra al loop.
+  detector:
+    build:
+      context: ./detector
+    container_name: siem-detector
+    environment:
+      - ES_URL=http://elasticsearch:9200
+    command: []  # acepta argumentos vía `docker compose run detector --algorithms all`
+    depends_on:
+      api:
+        condition: service_healthy
+      baseline:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── Ataques on-demand (profile=attack, no arrancan con `up`) ──
+  # Uso: docker compose run --rm ddos
+  #      docker compose run --rm bruteforce
+  ddos:
+    image: grafana/k6:latest
+    profiles: ["attack"]
+    command: ["run", "-e", "BASE_URL=http://api:5080", "/scripts/ddos.js"]
+    volumes:
+      - ./loadgen:/scripts:ro
+    depends_on:
+      api:
+        condition: service_healthy
+
+  bruteforce:
+    image: grafana/k6:latest
+    profiles: ["attack"]
+    command: ["run", "-e", "BASE_URL=http://api:5080", "/scripts/bruteforce.js"]
+    volumes:
+      - ./loadgen:/scripts:ro
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  es-data:
+    driver: local
